@@ -89,10 +89,21 @@ TTS_LANGUAGES: list[str] = [
     "es-MX",
     "tr",
     "vi",
+    # Not in xAI's official TTS list; sent to the API as "auto" (see
+    # TTS_AUTO_LANGUAGES / normalize_tts_language).
+    "fi",
     "auto",
 ]
 
-# STT languages from xAI docs (25+)
+# Languages offered in HA's TTS dropdown that xAI does not officially list.
+# xAI docs say the model can speak additional languages "with varying degrees
+# of accuracy", but an unlisted code may be rejected, so request "auto" and let
+# the model detect the language from the text.
+# https://docs.x.ai/developers/model-capabilities/audio/text-to-speech
+TTS_AUTO_LANGUAGES: frozenset[str] = frozenset({"fi"})
+
+# STT languages from xAI docs (38+)
+# https://docs.x.ai/developers/model-capabilities/audio/speech-to-text
 STT_LANGUAGES: list[str] = [
     "en",
     "en-US",
@@ -102,6 +113,7 @@ STT_LANGUAGES: list[str] = [
     "da",
     "nl",
     "fil",
+    "fi",
     "fr",
     "fr-FR",
     "de",
@@ -130,6 +142,19 @@ STT_LANGUAGES: list[str] = [
     "th",
     "tr",
     "vi",
+    # Added from current xAI STT docs (grok-voice-transcribe-2.0)
+    "bs",
+    "bg",
+    "yue",
+    "ca",
+    "zh",
+    "hr",
+    "el",
+    "hu",
+    "nb",
+    "sk",
+    "uk",
+    "ur",
 ]
 
 # Map HA Assist locale → xAI language param
@@ -139,6 +164,9 @@ def normalize_tts_language(language: str | None) -> str:
         return RECOMMENDED_TTS_LANGUAGE
     lang = language.replace("_", "-").strip()
     if lang.lower() == "auto":
+        return "auto"
+    # Unlisted languages (e.g. Finnish) -> let xAI auto-detect from the text
+    if lang.split("-")[0].lower() in TTS_AUTO_LANGUAGES:
         return "auto"
     # Exact match
     for supported in TTS_LANGUAGES:
@@ -170,7 +198,8 @@ def normalize_stt_language(language: str | None) -> str | None:
     known = {
         "ar", "cs", "da", "nl", "en", "fil", "fr", "de", "hi", "id", "it",
         "ja", "ko", "mk", "ms", "fa", "pl", "pt", "ro", "ru", "es", "sv",
-        "th", "tr", "vi",
+        "th", "tr", "vi", "fi", "bs", "bg", "yue", "ca", "zh", "hr", "el",
+        "hu", "nb", "sk", "uk", "ur",
     }
     if primary in known:
         return primary
