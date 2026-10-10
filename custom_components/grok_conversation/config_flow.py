@@ -727,6 +727,9 @@ def openai_config_option_schema(
             ): SelectSelector(
                 SelectSelectorConfig(
                     options=[
+                        SelectOptionDict(
+                            value="none", label="None (grok-4.3 only)"
+                        ),
                         SelectOptionDict(value="low", label="Low"),
                         SelectOptionDict(value="medium", label="Medium"),
                         SelectOptionDict(value="high", label="High"),

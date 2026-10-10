@@ -165,6 +165,35 @@ def format_citations(citations: Any) -> str:
     return f"\n\nSources:\n{lines}"
 
 
+# Models whose docs list ``none`` as a supported reasoning effort.
+# https://docs.x.ai/developers/models/grok-4.3
+_REASONING_NONE_PREFIXES = ("grok-4.3",)
+# Models that accept ``reasoning_effort`` but whose names lack "reasoning".
+# https://docs.x.ai/developers/model-capabilities/text/reasoning
+_REASONING_EFFORT_PREFIXES = ("grok-4.3", "grok-4.5", "grok-4.6", "grok-4.7")
+
+
+def reasoning_effort_for_model(model: str, effort: str | None) -> str | None:
+    """Return the reasoning effort to send for ``model``, or None to omit it.
+
+    Previously the effort was only sent when "reasoning" appeared in the model
+    name, which skipped grok-4.3/4.5+ (so the option silently did nothing) and
+    wrongly matched ``*-non-reasoning`` models.
+    """
+    if not effort:
+        return None
+    name = (model or "").strip().lower()
+    if "non-reasoning" in name:
+        return None
+    if name.startswith(_REASONING_EFFORT_PREFIXES):
+        if effort == "none" and not name.startswith(_REASONING_NONE_PREFIXES):
+            return None
+        return effort
+    if effort != "none" and "reasoning" in name:
+        return effort
+    return None
+
+
 def extract_responses_text(response: Any) -> str:
     """Pull assistant text out of a Responses API payload."""
     # Newer SDKs expose output_text
@@ -273,12 +302,9 @@ async def async_chat_completion(
         args["tool_choice"] = tool_choice or "auto"
     if response_format is not None:
         args["response_format"] = response_format
-    if (
-        reasoning_effort
-        and reasoning_effort != "none"
-        and "reasoning" in model.lower()
-    ):
-        args["reasoning_effort"] = reasoning_effort
+    effort = reasoning_effort_for_model(model, reasoning_effort)
+    if effort:
+        args["reasoning_effort"] = effort
     LOGGER.debug(
         "chat.completions.create model=%s tools=%s response_format=%s",
         model,
@@ -338,12 +364,9 @@ async def async_responses_completion(
         args["top_p"] = top_p
     if tools:
         args["tools"] = tools
-    if (
-        reasoning_effort
-        and reasoning_effort != "none"
-        and "reasoning" in model.lower()
-    ):
-        args["reasoning"] = {"effort": reasoning_effort}
+    effort = reasoning_effort_for_model(model, reasoning_effort)
+    if effort:
+        args["reasoning"] = {"effort": effort}
 
     LOGGER.debug(
         "responses.create model=%s live_search=%s tools=%s",

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 import json
+import re
 from pathlib import Path
 from typing import Any, Literal
 
@@ -55,6 +56,18 @@ from .usage import UsageTracker
 
 # Max number of back and forth with the LLM to generate a response
 MAX_TOOL_ITERATIONS = 10
+
+
+_THINK_BLOCK_RE = re.compile(
+    r"<(think|thinking|reasoning)>.*?(</\1>|$)", re.IGNORECASE | re.DOTALL
+)
+
+
+def strip_reasoning_markup(text: str | None) -> str:
+    """Remove <think>/<reasoning> blocks some models emit inline in content."""
+    if not text:
+        return ""
+    return _THINK_BLOCK_RE.sub("", text).strip()
 
 
 def _strip_json_from_response(response: str) -> str:
@@ -909,15 +922,22 @@ class GrokBaseLLMEntity(Entity):
                 ha_tool_calls, parse_errors = self._openai_tool_calls_to_ha(
                     message.tool_calls
                 )
+                # Text that accompanies a tool call is the model thinking out
+                # loud ("I need to call the tool...") — reasoning models such as
+                # grok-4.3 often emit it as plain content. It must never be
+                # spoken or shown, nor fed back to the model as something it
+                # "said". Keep it only as thinking_content for traces/debug.
+                pre_tool_text = strip_reasoning_markup(message.content)
                 assistant_content = conversation.AssistantContent(
                     agent_id=agent_id,
-                    content=message.content or "",
+                    content=None,
+                    thinking_content=pre_tool_text or None,
                     tool_calls=ha_tool_calls,
                 )
                 tool_messages: list[dict[str, Any]] = [
                     {
                         "role": "assistant",
-                        "content": message.content,
+                        "content": None,
                         "tool_calls": [
                             {
                                 "id": tc.id,
@@ -972,7 +992,7 @@ class GrokBaseLLMEntity(Entity):
                 await self._record_usage(model, p_tok, c_tok, service=service)
                 continue
 
-            raw_text = message.content or ""
+            raw_text = strip_reasoning_markup(message.content)
             full_response = (
                 raw_text if skip_json_strip else _strip_json_from_response(raw_text)
             )

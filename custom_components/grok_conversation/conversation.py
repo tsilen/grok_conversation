@@ -62,8 +62,32 @@ from .const import (
 from .entity import (
     GrokBaseLLMEntity,
     convert_content_to_param,
+    strip_reasoning_markup,
     _strip_json_from_response,
 )
+
+
+_DONE_PHRASES: dict[str, str] = {
+    "en": "Done.",
+    "fi": "Selvä.",
+    "sv": "Klart.",
+    "de": "Erledigt.",
+    "fr": "C'est fait.",
+    "es": "Hecho.",
+    "it": "Fatto.",
+    "nl": "Klaar.",
+    "pl": "Gotowe.",
+    "pt": "Feito.",
+    "da": "Færdig.",
+    "nb": "Ferdig.",
+    "hu": "Kész.",
+}
+
+
+def _done_phrase(language: str | None) -> str:
+    """Short confirmation used when tools ran but the model said nothing."""
+    primary = (language or "en").replace("_", "-").split("-")[0].lower()
+    return _DONE_PHRASES.get(primary, _DONE_PHRASES["en"])
 
 
 async def async_setup_entry(
@@ -167,21 +191,32 @@ class OpenAIConversationEntity(
         return True
 
     @staticmethod
-    def _pick_speech_content(chat_log: conversation.ChatLog) -> str | None:
-        """Prefer the last assistant message that is not a tool-call turn."""
-        fallback: str | None = None
+    def _pick_speech_content(
+        chat_log: conversation.ChatLog, language: str | None = None
+    ) -> str | None:
+        """Return the final assistant reply for the current turn.
+
+        Only assistant messages without tool calls count as a reply. Text that
+        accompanies a tool call is the model's pre-tool reasoning and is never
+        spoken (it previously leaked as a fallback when the model returned no
+        final text after the tool ran). If tools ran but the model gave no
+        final text, a short localized confirmation is returned instead.
+        """
+        ran_tools = False
         for content in reversed(chat_log.content):
+            if isinstance(content, conversation.UserContent):
+                break
             if not isinstance(content, conversation.AssistantContent):
                 continue
-            text = (content.content or "").strip()
-            if not text:
-                continue
             if getattr(content, "tool_calls", None):
-                if fallback is None:
-                    fallback = text
+                ran_tools = True
                 continue
-            return text
-        return fallback
+            text = strip_reasoning_markup(content.content)
+            if text:
+                return text
+        if ran_tools:
+            return _done_phrase(language)
+        return None
 
     def _build_factual_context(
         self, user_input: conversation.ConversationInput
@@ -555,7 +590,7 @@ class OpenAIConversationEntity(
                     show_citations=show_citations_effective,
                     reasoning_effort=options.get(CONF_REASONING_EFFORT),
                 )
-                text = _strip_json_from_response(text)
+                text = _strip_json_from_response(strip_reasoning_markup(text))
                 await self._record_usage(
                     model, p_tok, c_tok, service="conversation"
                 )
@@ -641,7 +676,7 @@ class OpenAIConversationEntity(
             raise HomeAssistantError(f"Error talking to xAI: {err}") from err
 
         intent_response = intent.IntentResponse(language=user_input.language)
-        speech = self._pick_speech_content(chat_log)
+        speech = self._pick_speech_content(chat_log, user_input.language)
         if speech:
             intent_response.async_set_speech(speech)
         else:
