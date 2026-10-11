@@ -172,3 +172,24 @@ async def test_chat_completion_sends_effort_for_grok_43() -> None:
         reasoning_effort="low",
     )
     assert "reasoning_effort" not in client.chat.completions.create.await_args.kwargs
+
+
+def test_action_guard_patterns() -> None:
+    from custom_components.grok_conversation.action_guard import (
+        claims_action,
+        language_instruction,
+        looks_like_command,
+    )
+
+    assert claims_action("I'll turn on the greenhouse lights now.")
+    assert claims_action("Laitan viherhuoneen valot päälle.")
+    assert claims_action("Sytytin keittiön valot.")
+    assert not claims_action("Pariisi on Ranskan pääkaupunki.")
+    assert not claims_action("The capital of France is Paris.")
+    assert looks_like_command("Laita viherhuoneen valot päälle.")
+    assert looks_like_command("Sammuta keittiön valo")
+    assert looks_like_command("Turn off the kitchen light")
+    assert not looks_like_command("Mikä on Ranskan pääkaupunki?")
+    assert not looks_like_command("What is the capital of France?")
+    assert "Finnish (fi)" in language_instruction("fi")
+    assert "Finnish (fi-FI)" in language_instruction("fi-FI")

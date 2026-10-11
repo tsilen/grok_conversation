@@ -219,6 +219,9 @@ async def test_conversation_fallback_does_not_inherit_partial_tools(
                 body=None,
             ),
             _completion_response("Recovered without prior tools."),
+            # Action guard: text-only reply to a command gets one corrective
+            # follow-up request.
+            _completion_response("Recovered without prior tools."),
         ]
     )
 
