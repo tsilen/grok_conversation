@@ -21,7 +21,9 @@ from .action_guard import (
     CORRECTION_PROMPT,
     claims_action,
     looks_like_command,
+    no_control_message,
     not_done_message,
+    summarize_turn_tools,
 )
 from homeassistant.helpers.entity import Entity
 from homeassistant.util import slugify
@@ -848,7 +850,6 @@ class GrokBaseLLMEntity(Entity):
         )
 
         # Action guard state for this turn (see action_guard.py)
-        tool_called = False
         corrected = False
         user_text = next(
             (
@@ -957,7 +958,6 @@ class GrokBaseLLMEntity(Entity):
             p_tok, c_tok = extract_usage(result)
 
             if getattr(message, "tool_calls", None):
-                tool_called = True
                 ha_tool_calls, parse_errors = self._openai_tool_calls_to_ha(
                     message.tool_calls
                 )
@@ -1037,41 +1037,76 @@ class GrokBaseLLMEntity(Entity):
             )
 
             # Action guard: the model answered a command (or claimed an
-            # action) without calling any tool, so nothing happened. Ask once
-            # more with an explicit correction; if it still calls no tool and
-            # claims an action, reply honestly instead of pretending.
+            # action) but no action tool succeeded in this turn - it called
+            # no tool, only read-only tools (e.g. GetLiveContext), or the
+            # action tool failed (e.g. no area matched a misheard name).
+            # Ask once more with an explicit correction; if it still claims
+            # an action, reply honestly instead of pretending.
+            turn_tools = summarize_turn_tools(chat_log)
             guard_applies = (
                 service == "conversation"
                 and bool(use_tools)
-                and not tool_called
+                and not turn_tools["action_ok"]
                 and response_format is None
                 and working_messages is not None
                 and choice.finish_reason != "length"
             )
+            # No HA tools at all (no LLM API selected, or chat-only mode): the
+            # model cannot act, so never let it claim that it did.
+            if (
+                service == "conversation"
+                and not use_tools
+                and response_format is None
+                and claims_action(full_response)
+                and looks_like_command(user_text)
+            ):
+                LOGGER.warning(
+                    "Device command but no Home Assistant tools are available "
+                    "(select Assist under 'Control Home Assistant' in the "
+                    "integration options); not passing on the model's claim: %r",
+                    full_response,
+                )
+                language = (
+                    chat_log.llm_api.llm_context.language
+                    if chat_log.llm_api
+                    else getattr(self, "_turn_language", None)
+                )
+                full_response = no_control_message(language)
             if guard_applies and not corrected and (
                 claims_action(full_response) or looks_like_command(user_text)
             ):
                 corrected = True
                 LOGGER.info(
-                    "xAI reply had no tool call for a likely action; "
-                    "requesting a corrected answer: %r",
+                    "xAI reply had no successful action tool call for a likely "
+                    "action (tool errors: %s); requesting a corrected answer: %r",
+                    turn_tools["errors"],
                     full_response,
                 )
                 chat_log.async_trace(
-                    {"action_guard": {"retry": True, "reply": full_response}}
+                    {
+                        "action_guard": {
+                            "retry": True,
+                            "reply": full_response,
+                            "tool_errors": turn_tools["errors"],
+                        }
+                    }
                 )
+                correction = CORRECTION_PROMPT
+                if turn_tools["errors"]:
+                    correction += (
+                        " Tool errors so far in this turn: "
+                        + "; ".join(turn_tools["errors"])[:500]
+                    )
                 working_messages.append(
                     {"role": "assistant", "content": full_response or ""}
                 )
-                working_messages.append(
-                    {"role": "system", "content": CORRECTION_PROMPT}
-                )
+                working_messages.append({"role": "system", "content": correction})
                 await self._record_usage(model, p_tok, c_tok, service=service)
                 continue
             if guard_applies and corrected and claims_action(full_response):
                 LOGGER.warning(
-                    "xAI claimed an action without calling a tool (after "
-                    "retry); replying honestly instead: %r",
+                    "xAI claimed an action without a successful action tool "
+                    "call (after retry); replying honestly instead: %r",
                     full_response,
                 )
                 language = (

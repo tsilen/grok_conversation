@@ -117,6 +117,9 @@ STEP_USER_DATA_SCHEMA = vol.Schema(
 
 RECOMMENDED_OPTIONS = {
     CONF_RECOMMENDED: True,
+    # New entries control HA via Assist by default (like HA's own LLM
+    # integrations); without it the model gets no areas, entities or tools.
+    CONF_LLM_HASS_API: [llm.LLM_API_ASSIST],
     CONF_PROMPT: GROK_SYSTEM_PROMPT,
     CONF_CHAT_MODEL: RECOMMENDED_CHAT_MODEL,
     CONF_FAST_MODEL: RECOMMENDED_FAST_MODEL,

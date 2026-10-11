@@ -11,7 +11,13 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_LLM_HASS_API, MATCH_ALL
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
-from homeassistant.helpers import device_registry as dr, intent, llm
+from homeassistant.helpers import (
+    area_registry as ar,
+    device_registry as dr,
+    floor_registry as fr,
+    intent,
+    llm,
+)
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.util import dt as dt_util
 
@@ -59,7 +65,12 @@ from .const import (
     VOICE_OPTIMIZED_SUFFIX,
     remap_retired_chat_model,
 )
-from .action_guard import is_not_done_message, language_instruction
+from .action_guard import (
+    is_not_done_message,
+    language_instruction,
+    not_done_message,
+    summarize_turn_tools,
+)
 from .entity import (
     GrokBaseLLMEntity,
     convert_content_to_param,
@@ -201,22 +212,26 @@ class OpenAIConversationEntity(
         accompanies a tool call is the model's pre-tool reasoning and is never
         spoken (it previously leaked as a fallback when the model returned no
         final text after the tool ran). If tools ran but the model gave no
-        final text, a short localized confirmation is returned instead.
+        final text, a short localized confirmation is returned only when an
+        action tool succeeded; if action tools only failed, an honest
+        failure message is returned.
         """
-        ran_tools = False
         for content in reversed(chat_log.content):
             if isinstance(content, conversation.UserContent):
                 break
             if not isinstance(content, conversation.AssistantContent):
                 continue
             if getattr(content, "tool_calls", None):
-                ran_tools = True
                 continue
             text = strip_reasoning_markup(content.content)
             if text:
                 return text
-        if ran_tools:
+        # No final text: confirm only if an action tool actually succeeded.
+        turn = summarize_turn_tools(chat_log)
+        if turn["action_ok"]:
             return _done_phrase(language)
+        if turn["action_failed"]:
+            return not_done_message(language)
         return None
 
     def _build_factual_context(
@@ -293,6 +308,69 @@ class OpenAIConversationEntity(
                 )
 
         return "\n".join(parts)
+
+    @staticmethod
+    def _set_tool_targets(
+        intent_response: intent.IntentResponse, chat_log: conversation.ChatLog
+    ) -> None:
+        """Mirror action tool success/failed targets into the response data."""
+        turn = summarize_turn_tools(chat_log)
+
+        def _targets(items: list[dict]) -> list[intent.IntentResponseTarget]:
+            out: list[intent.IntentResponseTarget] = []
+            for item in items:
+                try:
+                    out.append(
+                        intent.IntentResponseTarget(
+                            name=str(item.get("name", "")),
+                            type=intent.IntentResponseTargetType(item.get("type")),
+                            id=item.get("id"),
+                        )
+                    )
+                except (ValueError, TypeError):
+                    continue
+            return out
+
+        success = _targets(turn["success"])
+        failed = _targets(turn["failed"])
+        if success or failed:
+            intent_response.async_set_results(
+                success_results=success, failed_results=failed
+            )
+
+    _MAX_AREAS_IN_PROMPT = 80
+
+    def _build_area_context(self) -> str:
+        """Compact list of areas with aliases and floors for name matching.
+
+        HA's static context lists areas per exposed entity; this adds one
+        overview so the model can map misheard or inflected names (common
+        with Finnish speech-to-text) to the exact area name or alias.
+        """
+        areas = sorted(
+            ar.async_get(self.hass).async_list_areas(), key=lambda a: a.name
+        )
+        if not areas:
+            return ""
+        floor_reg = fr.async_get(self.hass)
+        lines: list[str] = []
+        for area in areas[: self._MAX_AREAS_IN_PROMPT]:
+            line = f"- {area.name}"
+            aliases = sorted(a for a in area.aliases if a and a != area.name)
+            if aliases:
+                line += f" (aliases: {', '.join(aliases)})"
+            floor_id = getattr(area, "floor_id", None)
+            if floor_id and (floor := floor_reg.async_get_floor(floor_id)):
+                line += f" [floor: {floor.name}]"
+            lines.append(line)
+        return (
+            "Areas in this home. In tool calls use an exact area name or alias "
+            "from this list. Speech recognition may mishear or inflect names "
+            "(e.g. Finnish genitive 'viherhuoneen' or a misheard "
+            "'vierahuoneen' for alias 'viherhuone'); map them to the closest "
+            "listed name. If nothing is close, ask the user.\n"
+            + "\n".join(lines)
+        )
 
     def _build_extra_system_prompt(
         self, user_input: conversation.ConversationInput
@@ -488,8 +566,24 @@ class OpenAIConversationEntity(
 
         # Chat-only: disable LLM HASS API tools
         llm_api_option = None if mode == MODE_CHAT_ONLY else options.get(CONF_LLM_HASS_API)
+        if isinstance(llm_api_option, list):
+            llm_api_option = [a for a in llm_api_option if a and a != "none"] or None
+        elif llm_api_option == "none":
+            llm_api_option = None
+        if not llm_api_option and mode != MODE_CHAT_ONLY:
+            LOGGER.warning(
+                "No Home Assistant LLM API selected ('Control Home Assistant' "
+                "option): Grok gets no areas, entities or tools and cannot "
+                "control devices"
+            )
+        # Used for localized replies when no LLM API (and so no llm_context)
+        self._turn_language = user_input.language
 
         extra = self._build_extra_system_prompt(user_input)
+        if llm_api_option:
+            area_context = self._build_area_context()
+            if area_context:
+                extra = "\n".join(p for p in (extra, area_context) if p)
         user_extra = user_input.extra_system_prompt or ""
         combined_extra = "\n".join(p for p in (extra, user_extra) if p)
 
@@ -688,6 +782,7 @@ class OpenAIConversationEntity(
             )
         elif speech:
             intent_response.async_set_speech(speech)
+            self._set_tool_targets(intent_response, chat_log)
         else:
             intent_response.async_set_speech(
                 "Sorry, I couldn't generate a response."
