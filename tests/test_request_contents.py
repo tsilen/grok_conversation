@@ -10,6 +10,7 @@ import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import openai
+import pytest
 
 from homeassistant.components import conversation
 from homeassistant.components.homeassistant.exposed_entities import (
@@ -364,3 +365,83 @@ def test_recommended_options_enable_assist() -> None:
     from custom_components.grok_conversation.config_flow import RECOMMENDED_OPTIONS
 
     assert RECOMMENDED_OPTIONS[CONF_LLM_HASS_API] == [llm.LLM_API_ASSIST]
+
+
+REAL_REPLY = '{ "speech": "Sytytettiin olohuoneen valot.", "action_claimed": true }'
+
+
+async def _run_post_tool(hass, entry, client, final_content: str):
+    client.chat.completions.create = AsyncMock(
+        side_effect=_scripted(
+            _tool("HassTurnOn", TURN_ON_OK), _completion_response(final_content)
+        )
+    )
+    return await _converse(hass, entry, text="Sytytä olohuoneen valot")
+
+
+@pytest.mark.parametrize(
+    "final_content",
+    [
+        REAL_REPLY,
+        f"  \n{REAL_REPLY}\n  ",
+        f"```json\n{REAL_REPLY}\n```",
+        f"```\n{REAL_REPLY}\n```",
+        '{\n  "speech": "Sytytettiin olohuoneen valot.",\n  "action_claimed": true\n}',
+        f"Here you go: {REAL_REPLY} (done)",
+        f"<think>tool ok</think>{REAL_REPLY}",
+    ],
+)
+async def test_post_tool_structured_reply_is_never_spoken_as_json(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_openai_client: MagicMock,
+    final_content: str,
+) -> None:
+    await _setup_greenroom(hass)
+    result = await _run_post_tool(
+        hass, mock_config_entry, mock_openai_client, final_content
+    )
+    calls = mock_openai_client.chat.completions.create.await_args_list
+    # Format is requested on the post-tool final-answer request too
+    assert calls[1].kwargs["response_format"] == FINAL_RESPONSE_FORMAT
+    assert result.response.response_type == intent.IntentResponseType.ACTION_DONE
+    assert result.response.speech["plain"]["speech"] == "Sytytettiin olohuoneen valot."
+
+
+async def test_structured_reply_parsed_even_after_format_rejected(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_openai_client: MagicMock,
+) -> None:
+    """Format rejected by the API, model still answers with JSON: parse it."""
+    await _setup_greenroom(hass)
+
+    async def _create(**kwargs):
+        if kwargs.get("response_format"):
+            raise openai.BadRequestError("nope", response=MagicMock(), body=None)
+        return _completion_response(f"```json\n{REAL_REPLY}\n```")
+
+    mock_openai_client.chat.completions.create = AsyncMock(side_effect=_create)
+    result = await _converse(hass, mock_config_entry, text="Hei")
+    assert result.response.speech["plain"]["speech"] == "Sytytettiin olohuoneen valot."
+
+
+async def test_plain_text_with_braces_is_spoken_unchanged(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_openai_client: MagicMock,
+) -> None:
+    await _setup_greenroom(hass)
+    text = "Use the {area} placeholder in templates."
+    mock_openai_client.chat.completions.create = AsyncMock(
+        side_effect=_scripted(_completion_response(text))
+    )
+    result = await _converse(hass, mock_config_entry, text="Hei")
+    assert result.response.speech["plain"]["speech"] == text
+
+
+def test_pick_speech_never_returns_structured_json() -> None:
+    from custom_components.grok_conversation.action_guard import speech_from_reply
+
+    assert speech_from_reply(REAL_REPLY) == "Sytytettiin olohuoneen valot."
+    assert speech_from_reply("plain") == "plain"

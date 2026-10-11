@@ -1048,9 +1048,17 @@ class GrokBaseLLMEntity(Entity):
                 await self._record_usage(model, p_tok, c_tok, service=service)
                 continue
 
+            LOGGER.debug(
+                "xAI final reply (structured format requested=%s): %r",
+                final_format_used,
+                message.content,
+            )
             raw_text = strip_reasoning_markup(message.content)
             action_claimed: bool | None = None
-            if final_format_used:
+            if service == "conversation" and response_format is None:
+                # Parse whenever the reply carries the structured answer, even
+                # if this request did not set response_format (format
+                # rejected, or the model wrapped it in fences/text).
                 raw_text, action_claimed = parse_final_response(raw_text)
             full_response = (
                 raw_text if skip_json_strip else _strip_json_from_response(raw_text)

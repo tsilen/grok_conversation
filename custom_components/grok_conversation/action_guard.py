@@ -14,6 +14,7 @@ happens. Nothing here parses the model's or the user's text:
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 # Structured final answer for conversation turns. Tool-call turns are not
@@ -51,23 +52,41 @@ FINAL_RESPONSE_FORMAT: dict[str, Any] = {
 }
 
 
+_FENCE_RE = re.compile(r"^```[a-zA-Z0-9_-]*\s*|\s*```\s*$")
+
+
 def parse_final_response(text: str | None) -> tuple[str, bool | None]:
     """Return (speech, action_claimed) from a structured final answer.
 
-    If the content is not the expected JSON object (model ignored the
-    format), return the raw text and None (unknown).
+    Tolerates surrounding whitespace, ```json fences, text before or after
+    the object and pretty-printed JSON. If no object with a string
+    ``speech`` is found, return the text unchanged and None (unknown).
     """
     raw = (text or "").strip()
-    if not raw.startswith("{"):
+    if "{" not in raw:
         return raw, None
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        return raw, None
-    if not isinstance(data, dict) or not isinstance(data.get("speech"), str):
-        return raw, None
-    claimed = data.get("action_claimed")
-    return data["speech"].strip(), claimed if isinstance(claimed, bool) else None
+    candidate = _FENCE_RE.sub("", raw).strip()
+    decoder = json.JSONDecoder()
+    start = candidate.find("{")
+    while start != -1:
+        try:
+            data, _end = decoder.raw_decode(candidate, start)
+        except json.JSONDecodeError:
+            start = candidate.find("{", start + 1)
+            continue
+        if isinstance(data, dict) and isinstance(data.get("speech"), str):
+            claimed = data.get("action_claimed")
+            return (
+                data["speech"].strip(),
+                claimed if isinstance(claimed, bool) else None,
+            )
+        start = candidate.find("{", start + 1)
+    return raw, None
+
+
+def speech_from_reply(text: str | None) -> str:
+    """Speech for a stored reply; never returns a structured JSON answer."""
+    return parse_final_response(text)[0]
 
 
 CORRECTION_PROMPT = (

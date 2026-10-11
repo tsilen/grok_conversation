@@ -66,7 +66,11 @@ from .const import (
     VOICE_OPTIMIZED_SUFFIX,
     remap_retired_chat_model,
 )
-from .action_guard import language_instruction, summarize_turn_tools
+from .action_guard import (
+    language_instruction,
+    speech_from_reply,
+    summarize_turn_tools,
+)
 from .entity import (
     GrokBaseLLMEntity,
     convert_content_to_param,
@@ -195,7 +199,8 @@ class OpenAIConversationEntity(
                 continue
             if getattr(content, "tool_calls", None):
                 continue
-            text = strip_reasoning_markup(content.content)
+            # Safety net: never speak a structured JSON answer.
+            text = speech_from_reply(strip_reasoning_markup(content.content))
             if text:
                 return text
         # No final text after a successful action: empty speech (the action
