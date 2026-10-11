@@ -59,6 +59,7 @@ from .const import (
     VOICE_OPTIMIZED_SUFFIX,
     remap_retired_chat_model,
 )
+from .action_guard import is_not_done_message, language_instruction
 from .entity import (
     GrokBaseLLMEntity,
     convert_content_to_param,
@@ -278,6 +279,8 @@ class OpenAIConversationEntity(
         """Voice-style and user-name hints (not required for search grounding)."""
         options = self.entry.options
         parts: list[str] = []
+
+        parts.append(language_instruction(user_input.language))
 
         if options.get(CONF_VOICE_OPTIMIZED, RECOMMENDED_VOICE_OPTIMIZED):
             parts.append(VOICE_OPTIMIZED_SUFFIX.strip())
@@ -677,7 +680,13 @@ class OpenAIConversationEntity(
 
         intent_response = intent.IntentResponse(language=user_input.language)
         speech = self._pick_speech_content(chat_log, user_input.language)
-        if speech:
+        if speech and is_not_done_message(speech):
+            # Model claimed an action but no tool ran: report a failure
+            # instead of the default action_done response type.
+            intent_response.async_set_error(
+                intent.IntentResponseErrorCode.FAILED_TO_HANDLE, speech
+            )
+        elif speech:
             intent_response.async_set_speech(speech)
         else:
             intent_response.async_set_speech(

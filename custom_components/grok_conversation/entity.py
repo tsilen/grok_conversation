@@ -16,6 +16,13 @@ from homeassistant.components import conversation
 from homeassistant.config_entries import ConfigEntry, ConfigSubentry
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import device_registry as dr, llm
+
+from .action_guard import (
+    CORRECTION_PROMPT,
+    claims_action,
+    looks_like_command,
+    not_done_message,
+)
 from homeassistant.helpers.entity import Entity
 from homeassistant.util import slugify
 from homeassistant.util.json import json_loads
@@ -840,6 +847,18 @@ class GrokBaseLLMEntity(Entity):
             else RECOMMENDED_MAX_TOKENS
         )
 
+        # Action guard state for this turn (see action_guard.py)
+        tool_called = False
+        corrected = False
+        user_text = next(
+            (
+                c.content
+                for c in reversed(chat_log.content)
+                if isinstance(c, conversation.UserContent)
+            ),
+            None,
+        )
+
         for _iteration in range(max_iterations):
             if working_messages is None:
                 request_messages = self._messages_from_chat_log(
@@ -893,6 +912,25 @@ class GrokBaseLLMEntity(Entity):
                 use_tools = tools
             use_response_format = response_format
 
+            LOGGER.debug(
+                "xAI request model=%s iteration=%s tools=%s",
+                model,
+                _iteration,
+                [t["function"]["name"] for t in use_tools or []],
+            )
+            if _iteration == 0:
+                # HA logs the prompt under homeassistant.components.conversation;
+                # log it here too so the integration's own debug log shows it.
+                system_prompt = next(
+                    (
+                        m.get("content")
+                        for m in request_messages
+                        if m.get("role") == "system"
+                    ),
+                    None,
+                )
+                LOGGER.debug("xAI system prompt: %s", system_prompt)
+
             try:
                 result = await async_chat_completion(
                     client,
@@ -919,6 +957,7 @@ class GrokBaseLLMEntity(Entity):
             p_tok, c_tok = extract_usage(result)
 
             if getattr(message, "tool_calls", None):
+                tool_called = True
                 ha_tool_calls, parse_errors = self._openai_tool_calls_to_ha(
                     message.tool_calls
                 )
@@ -996,6 +1035,52 @@ class GrokBaseLLMEntity(Entity):
             full_response = (
                 raw_text if skip_json_strip else _strip_json_from_response(raw_text)
             )
+
+            # Action guard: the model answered a command (or claimed an
+            # action) without calling any tool, so nothing happened. Ask once
+            # more with an explicit correction; if it still calls no tool and
+            # claims an action, reply honestly instead of pretending.
+            guard_applies = (
+                service == "conversation"
+                and bool(use_tools)
+                and not tool_called
+                and response_format is None
+                and working_messages is not None
+                and choice.finish_reason != "length"
+            )
+            if guard_applies and not corrected and (
+                claims_action(full_response) or looks_like_command(user_text)
+            ):
+                corrected = True
+                LOGGER.info(
+                    "xAI reply had no tool call for a likely action; "
+                    "requesting a corrected answer: %r",
+                    full_response,
+                )
+                chat_log.async_trace(
+                    {"action_guard": {"retry": True, "reply": full_response}}
+                )
+                working_messages.append(
+                    {"role": "assistant", "content": full_response or ""}
+                )
+                working_messages.append(
+                    {"role": "system", "content": CORRECTION_PROMPT}
+                )
+                await self._record_usage(model, p_tok, c_tok, service=service)
+                continue
+            if guard_applies and corrected and claims_action(full_response):
+                LOGGER.warning(
+                    "xAI claimed an action without calling a tool (after "
+                    "retry); replying honestly instead: %r",
+                    full_response,
+                )
+                language = (
+                    chat_log.llm_api.llm_context.language
+                    if chat_log.llm_api
+                    else None
+                )
+                full_response = not_done_message(language)
+
             if full_response or skip_json_strip:
                 async for _ in chat_log.async_add_assistant_content(
                     conversation.AssistantContent(
