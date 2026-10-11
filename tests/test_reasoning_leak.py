@@ -193,3 +193,36 @@ def test_action_guard_patterns() -> None:
     assert not looks_like_command("What is the capital of France?")
     assert "Finnish (fi)" in language_instruction("fi")
     assert "Finnish (fi-FI)" in language_instruction("fi-FI")
+
+
+def test_tool_result_outcome_and_read_only() -> None:
+    from custom_components.grok_conversation.action_guard import (
+        is_read_only_tool,
+        tool_result_outcome,
+    )
+
+    ok = {
+        "response_type": "action_done",
+        "data": {"success": [{"name": "Greenroom", "type": "area", "id": "g"}],
+                 "failed": [], "targets": []},
+    }
+    assert tool_result_outcome(ok)[0] is False
+    assert tool_result_outcome(ok)[1][0]["id"] == "g"
+    err = {"error": "MatchFailedError", "error_text": "No area named vierahuone"}
+    assert tool_result_outcome(err) == (True, [], [], "No area named vierahuone")
+    assert tool_result_outcome({"response_type": "error", "data": {"code": "no_valid_targets"}})[0]
+    assert is_read_only_tool("homeassistant__GetLiveContext")
+    assert is_read_only_tool("GetLiveContext")
+    assert not is_read_only_tool("intent__HassTurnOn")
+    assert claims_action_ok()
+
+
+def claims_action_ok() -> bool:
+    from custom_components.grok_conversation.action_guard import claims_action
+
+    # Status answers are not action claims
+    return (
+        not claims_action("Viherhuoneen valo on pois päältä.")
+        and not claims_action("Valo on päällä.")
+        and claims_action("Selvä Tuomas.")
+    )

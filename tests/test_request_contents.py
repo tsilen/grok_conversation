@@ -45,7 +45,8 @@ def _scripted(*steps):
 
 async def _setup_greenroom(hass: HomeAssistant) -> None:
     assert await async_setup_component(hass, "intent", {})
-    async_mock_service(hass, "light", "turn_on")
+    if not hass.services.has_service("light", "turn_on"):
+        async_mock_service(hass, "light", "turn_on")
     area = ar.async_get(hass).async_create("greenroom", aliases={"viherhuone"})
     entry = er.async_get(hass).async_get_or_create(
         "light", "test", "greenroom_1", suggested_object_id="greenroom"
@@ -177,3 +178,171 @@ async def test_plain_question_is_not_retried(
     )
     assert mock_openai_client.chat.completions.create.await_count == 1
     assert result.response.speech["plain"]["speech"] == "Pariisi on Ranskan pääkaupunki."
+
+
+def _tool(suffix: str, args: str, call_id: str = "call_1"):
+    """Step: call the tool whose (possibly namespaced) name ends with suffix."""
+
+    def _step(kwargs):
+        name = next(
+            t["function"]["name"]
+            for t in kwargs["tools"]
+            if t["function"]["name"].endswith(suffix)
+        )
+        return _completion_response(tool_calls=[_tool_call(name, args, call_id)])
+
+    return _step
+
+
+async def test_system_prompt_lists_areas_with_aliases(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_openai_client: MagicMock,
+) -> None:
+    await _setup_greenroom(hass)
+    mock_openai_client.chat.completions.create = AsyncMock(
+        side_effect=_scripted(_completion_response("Pariisi."))
+    )
+    await _converse(hass, mock_config_entry, text="Mikä on Ranskan pääkaupunki?")
+    system = mock_openai_client.chat.completions.create.await_args_list[0].kwargs[
+        "messages"
+    ][0]["content"]
+    assert "Areas in this home" in system
+    assert "- greenroom (aliases: viherhuone)" in system
+
+
+async def test_misheard_area_tool_error_triggers_corrected_retry(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_openai_client: MagicMock,
+) -> None:
+    """HassTurnOn fails on 'vierahuone', model says 'Selvä' -> retry -> success."""
+    turn_on_calls = async_mock_service(hass, "light", "turn_on")
+    await _setup_greenroom(hass)
+    mock_openai_client.chat.completions.create = AsyncMock(
+        side_effect=_scripted(
+            _tool("HassTurnOn", '{"area":"vierahuone","domain":["light"]}', "c1"),
+            _completion_response("Selvä Tuomas."),
+            _tool("HassTurnOn", '{"area":"viherhuone","domain":["light"]}', "c2"),
+            _completion_response("Viherhuoneen valot ovat päällä."),
+        )
+    )
+    result = await _converse(
+        hass, mock_config_entry, text="Laita vierahuoneen valot päälle."
+    )
+    calls = mock_openai_client.chat.completions.create.await_args_list
+    assert len(calls) == 4
+    correction = calls[2].kwargs["messages"][-1]
+    assert correction["role"] == "system"
+    assert "Tool errors so far" in correction["content"]
+    assert len(turn_on_calls) == 1
+    assert result.response.response_type == intent.IntentResponseType.ACTION_DONE
+    assert result.response.speech["plain"]["speech"] == "Viherhuoneen valot ovat päällä."
+    assert "light.greenroom" in [t.id for t in result.response.success_results]
+
+
+async def test_only_read_tool_then_claim_reports_failure(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_openai_client: MagicMock,
+) -> None:
+    """GetLiveContext alone is not an action: 'Selvä' twice -> honest error."""
+    await _setup_greenroom(hass)
+    mock_openai_client.chat.completions.create = AsyncMock(
+        side_effect=_scripted(
+            _tool("GetLiveContext", "{}"),
+            _completion_response("Selvä Tuomas."),
+            _completion_response("Selvä Tuomas."),
+        )
+    )
+    result = await _converse(
+        hass, mock_config_entry, text="Laita vierahuoneen valot päälle."
+    )
+    assert mock_openai_client.chat.completions.create.await_count == 3
+    assert result.response.response_type == intent.IntentResponseType.ERROR
+    assert "en saanut" in result.response.speech["plain"]["speech"]
+
+
+async def test_status_question_with_read_tool_is_not_retried(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_openai_client: MagicMock,
+) -> None:
+    await _setup_greenroom(hass)
+    mock_openai_client.chat.completions.create = AsyncMock(
+        side_effect=_scripted(
+            _tool("GetLiveContext", "{}"),
+            _completion_response("Viherhuoneen valo on pois päältä."),
+        )
+    )
+    result = await _converse(
+        hass, mock_config_entry, text="Onko viherhuoneen valo päällä?"
+    )
+    assert mock_openai_client.chat.completions.create.await_count == 2
+    assert result.response.speech["plain"]["speech"] == "Viherhuoneen valo on pois päältä."
+
+
+async def test_failed_action_with_empty_reply_is_not_confirmed(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_openai_client: MagicMock,
+) -> None:
+    """Empty final text after a failed action must not say 'Selvä.'."""
+    await _setup_greenroom(hass)
+    mock_openai_client.chat.completions.create = AsyncMock(
+        side_effect=_scripted(
+            _tool("HassTurnOn", '{"area":"vierahuone","domain":["light"]}'),
+            _completion_response(""),
+            _completion_response(""),
+        )
+    )
+    result = await _converse(
+        hass, mock_config_entry, text="Laita vierahuoneen valot päälle."
+    )
+    assert result.response.response_type == intent.IntentResponseType.ERROR
+    assert result.response.speech["plain"]["speech"] != "Selvä."
+
+
+async def test_no_llm_api_command_claim_is_not_passed_on(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_openai_client: MagicMock,
+) -> None:
+    """Without an LLM API no tools exist; 'Selvä Tuomas.' must not be spoken."""
+    await _setup_greenroom(hass)
+    client = mock_config_entry.runtime_data
+    pkg = "custom_components.grok_conversation"
+    options = {k: v for k, v in mock_config_entry.options.items() if k != CONF_LLM_HASS_API}
+    with (
+        patch(f"{pkg}.openai.AsyncOpenAI", return_value=client),
+        patch(f"{pkg}.async_validate_voice_access", return_value=(True, "ok")),
+        patch(f"{pkg}.get_async_client", return_value=None),
+    ):
+        hass.config_entries.async_update_entry(mock_config_entry, options=options)
+        await hass.async_block_till_done()
+    mock_config_entry.runtime_data = client
+    client.chat.completions.create = AsyncMock(
+        side_effect=_scripted(_completion_response("Selvä Tuomas."))
+    )
+    agent = conversation.async_get_agent(hass, mock_config_entry.entry_id)
+    result = await conversation.async_converse(
+        hass,
+        text="Laita vierahuoneen valot päälle.",
+        conversation_id=None,
+        context=Context(),
+        language="fi",
+        agent_id=agent.entity_id,
+    )
+    kwargs = client.chat.completions.create.await_args.kwargs
+    assert "tools" not in kwargs
+    assert "Static Context" not in kwargs["messages"][0]["content"]
+    assert result.response.response_type == intent.IntentResponseType.ERROR
+    assert "Control Home Assistant" in result.response.speech["plain"]["speech"]
+
+
+def test_recommended_options_enable_assist() -> None:
+    from homeassistant.helpers import llm
+
+    from custom_components.grok_conversation.config_flow import RECOMMENDED_OPTIONS
+
+    assert RECOMMENDED_OPTIONS[CONF_LLM_HASS_API] == [llm.LLM_API_ASSIST]
