@@ -75,9 +75,9 @@ async def test_pre_tool_reasoning_not_spoken_when_final_empty(
         ],
     )
     assert tool.calls == [{"action": "turn_on"}]
-    speech = entity._pick_speech_content(chat_log, "fi")  # noqa: SLF001
-    assert speech == "Selvä."
-    assert entity._pick_speech_content(chat_log, "en-US") == "Done."  # noqa: SLF001
+    # Successful action without final text: empty speech, never the
+    # pre-tool reasoning and no hardcoded confirmation text.
+    assert entity._pick_speech_content(chat_log, "fi") == ""  # noqa: SLF001
 
     # Kept only as thinking content, never as visible content
     tool_turns = [
@@ -174,27 +174,6 @@ async def test_chat_completion_sends_effort_for_grok_43() -> None:
     assert "reasoning_effort" not in client.chat.completions.create.await_args.kwargs
 
 
-def test_action_guard_patterns() -> None:
-    from custom_components.grok_conversation.action_guard import (
-        claims_action,
-        language_instruction,
-        looks_like_command,
-    )
-
-    assert claims_action("I'll turn on the greenhouse lights now.")
-    assert claims_action("Laitan viherhuoneen valot päälle.")
-    assert claims_action("Sytytin keittiön valot.")
-    assert not claims_action("Pariisi on Ranskan pääkaupunki.")
-    assert not claims_action("The capital of France is Paris.")
-    assert looks_like_command("Laita viherhuoneen valot päälle.")
-    assert looks_like_command("Sammuta keittiön valo")
-    assert looks_like_command("Turn off the kitchen light")
-    assert not looks_like_command("Mikä on Ranskan pääkaupunki?")
-    assert not looks_like_command("What is the capital of France?")
-    assert "Finnish (fi)" in language_instruction("fi")
-    assert "Finnish (fi-FI)" in language_instruction("fi-FI")
-
-
 def test_tool_result_outcome_and_read_only() -> None:
     from custom_components.grok_conversation.action_guard import (
         is_read_only_tool,
@@ -214,15 +193,27 @@ def test_tool_result_outcome_and_read_only() -> None:
     assert is_read_only_tool("homeassistant__GetLiveContext")
     assert is_read_only_tool("GetLiveContext")
     assert not is_read_only_tool("intent__HassTurnOn")
-    assert claims_action_ok()
 
 
-def claims_action_ok() -> bool:
-    from custom_components.grok_conversation.action_guard import claims_action
 
-    # Status answers are not action claims
-    return (
-        not claims_action("Viherhuoneen valo on pois päältä.")
-        and not claims_action("Valo on päällä.")
-        and claims_action("Selvä Tuomas.")
+def test_parse_final_response() -> None:
+    from custom_components.grok_conversation.action_guard import (
+        parse_final_response,
     )
+
+    assert parse_final_response('{"speech": "Hi", "action_claimed": true}') == (
+        "Hi",
+        True,
+    )
+    assert parse_final_response("plain text") == ("plain text", None)
+    assert parse_final_response("{not json") == ("{not json", None)
+    assert parse_final_response('{"speech": 1}') == ('{"speech": 1}', None)
+
+
+def test_language_instruction_uses_code_only() -> None:
+    from custom_components.grok_conversation.action_guard import (
+        language_instruction,
+    )
+
+    assert "language code: fi" in language_instruction("fi")
+    assert "language code: pt-BR" in language_instruction("pt-BR")

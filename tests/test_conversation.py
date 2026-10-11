@@ -219,9 +219,6 @@ async def test_conversation_fallback_does_not_inherit_partial_tools(
                 body=None,
             ),
             _completion_response("Recovered without prior tools."),
-            # Action guard: text-only reply to a command gets one corrective
-            # follow-up request.
-            _completion_response("Recovered without prior tools."),
         ]
     )
 
@@ -277,6 +274,9 @@ async def test_invalid_tool_argument_json_returns_error(
             _completion_response(
                 tool_calls=[_tool_call("test_light", "{not-json")]
             ),
+            _completion_response("I could not parse that tool call."),
+            # Action guard: a failed action tool call gets one corrective
+            # follow-up request.
             _completion_response("I could not parse that tool call."),
         ]
     )

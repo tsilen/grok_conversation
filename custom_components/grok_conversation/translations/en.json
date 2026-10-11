@@ -157,5 +157,13 @@
       "name": "Home briefing",
       "description": "Summarize current home state with Grok"
     }
+  },
+  "exceptions": {
+    "action_not_performed": {
+      "message": "Sorry, that was not done: no device command succeeded."
+    },
+    "no_control": {
+      "message": "I can't control devices: select Assist under 'Control Home Assistant' in the xAI Grok integration options."
+    }
   }
 }
