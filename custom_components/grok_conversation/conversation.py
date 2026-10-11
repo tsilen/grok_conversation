@@ -17,6 +17,7 @@ from homeassistant.helpers import (
     floor_registry as fr,
     intent,
     llm,
+    translation,
 )
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.util import dt as dt_util
@@ -65,41 +66,13 @@ from .const import (
     VOICE_OPTIMIZED_SUFFIX,
     remap_retired_chat_model,
 )
-from .action_guard import (
-    is_not_done_message,
-    language_instruction,
-    not_done_message,
-    summarize_turn_tools,
-)
+from .action_guard import language_instruction, summarize_turn_tools
 from .entity import (
     GrokBaseLLMEntity,
     convert_content_to_param,
     strip_reasoning_markup,
     _strip_json_from_response,
 )
-
-
-_DONE_PHRASES: dict[str, str] = {
-    "en": "Done.",
-    "fi": "Selvä.",
-    "sv": "Klart.",
-    "de": "Erledigt.",
-    "fr": "C'est fait.",
-    "es": "Hecho.",
-    "it": "Fatto.",
-    "nl": "Klaar.",
-    "pl": "Gotowe.",
-    "pt": "Feito.",
-    "da": "Færdig.",
-    "nb": "Ferdig.",
-    "hu": "Kész.",
-}
-
-
-def _done_phrase(language: str | None) -> str:
-    """Short confirmation used when tools ran but the model said nothing."""
-    primary = (language or "en").replace("_", "-").split("-")[0].lower()
-    return _DONE_PHRASES.get(primary, _DONE_PHRASES["en"])
 
 
 async def async_setup_entry(
@@ -212,9 +185,8 @@ class OpenAIConversationEntity(
         accompanies a tool call is the model's pre-tool reasoning and is never
         spoken (it previously leaked as a fallback when the model returned no
         final text after the tool ran). If tools ran but the model gave no
-        final text, a short localized confirmation is returned only when an
-        action tool succeeded; if action tools only failed, an honest
-        failure message is returned.
+        final text, an empty string is returned when an action tool
+        succeeded, otherwise None.
         """
         for content in reversed(chat_log.content):
             if isinstance(content, conversation.UserContent):
@@ -226,12 +198,10 @@ class OpenAIConversationEntity(
             text = strip_reasoning_markup(content.content)
             if text:
                 return text
-        # No final text: confirm only if an action tool actually succeeded.
-        turn = summarize_turn_tools(chat_log)
-        if turn["action_ok"]:
-            return _done_phrase(language)
-        if turn["action_failed"]:
-            return not_done_message(language)
+        # No final text after a successful action: empty speech (the action
+        # result speaks for itself; no hardcoded confirmation text).
+        if summarize_turn_tools(chat_log)["action_ok"]:
+            return ""
         return None
 
     def _build_factual_context(
@@ -309,6 +279,20 @@ class OpenAIConversationEntity(
 
         return "\n".join(parts)
 
+    async def _async_translated(self, language: str | None, key: str) -> str:
+        """Look up exceptions.<key>.message for the user's language (en fallback)."""
+        lang = (language or "en").replace("_", "-")
+        for candidate in dict.fromkeys((lang, lang.split("-")[0], "en")):
+            try:
+                strings = await translation.async_get_translations(
+                    self.hass, candidate, "exceptions", {DOMAIN}
+                )
+            except Exception:  # noqa: BLE001
+                continue
+            if msg := strings.get(f"component.{DOMAIN}.exceptions.{key}.message"):
+                return msg
+        return ""
+
     @staticmethod
     def _set_tool_targets(
         intent_response: intent.IntentResponse, chat_log: conversation.ChatLog
@@ -345,7 +329,7 @@ class OpenAIConversationEntity(
 
         HA's static context lists areas per exposed entity; this adds one
         overview so the model can map misheard or inflected names (common
-        with Finnish speech-to-text) to the exact area name or alias.
+        with speech-to-text) to the exact area name or alias.
         """
         areas = sorted(
             ar.async_get(self.hass).async_list_areas(), key=lambda a: a.name
@@ -365,10 +349,9 @@ class OpenAIConversationEntity(
             lines.append(line)
         return (
             "Areas in this home. In tool calls use an exact area name or alias "
-            "from this list. Speech recognition may mishear or inflect names "
-            "(e.g. Finnish genitive 'viherhuoneen' or a misheard "
-            "'vierahuoneen' for alias 'viherhuone'); map them to the closest "
-            "listed name. If nothing is close, ask the user.\n"
+            "from this list. Speech recognition may mishear names and users "
+            "may use inflected forms; map them to the closest listed name or "
+            "alias. If nothing is close, ask the user.\n"
             + "\n".join(lines)
         )
 
@@ -576,8 +559,6 @@ class OpenAIConversationEntity(
                 "option): Grok gets no areas, entities or tools and cannot "
                 "control devices"
             )
-        # Used for localized replies when no LLM API (and so no llm_context)
-        self._turn_language = user_input.language
 
         extra = self._build_extra_system_prompt(user_input)
         if llm_api_option:
@@ -773,20 +754,36 @@ class OpenAIConversationEntity(
             raise HomeAssistantError(f"Error talking to xAI: {err}") from err
 
         intent_response = intent.IntentResponse(language=user_input.language)
-        speech = self._pick_speech_content(chat_log, user_input.language)
-        if speech and is_not_done_message(speech):
-            # Model claimed an action but no tool ran: report a failure
-            # instead of the default action_done response type.
+        outcome = self._turn_outcomes.pop(chat_log.conversation_id, {})
+        speech: str | None
+        if fallback_key := outcome.get("fallback"):
+            # Model claimed an action that did not happen: report a failure.
+            # Text comes from translations (no hardcoded language strings).
+            speech = await self._async_translated(user_input.language, fallback_key)
             intent_response.async_set_error(
                 intent.IntentResponseErrorCode.FAILED_TO_HANDLE, speech
             )
-        elif speech:
-            intent_response.async_set_speech(speech)
-            self._set_tool_targets(intent_response, chat_log)
         else:
-            intent_response.async_set_speech(
-                "Sorry, I couldn't generate a response."
-            )
+            speech = self._pick_speech_content(chat_log, user_input.language)
+            if speech is not None and outcome.get("action_failed"):
+                # Action tools failed and none succeeded; the model explains.
+                intent_response.async_set_error(
+                    intent.IntentResponseErrorCode.FAILED_TO_HANDLE, speech
+                )
+            elif speech is not None:
+                intent_response.async_set_speech(speech)
+                self._set_tool_targets(intent_response, chat_log)
+            elif outcome.get("action_failed"):
+                speech = await self._async_translated(
+                    user_input.language, "action_not_performed"
+                )
+                intent_response.async_set_error(
+                    intent.IntentResponseErrorCode.FAILED_TO_HANDLE, speech
+                )
+            else:
+                intent_response.async_set_speech(
+                    "Sorry, I couldn't generate a response."
+                )
 
         return conversation.ConversationResult(
             response=intent_response,

@@ -1,143 +1,95 @@
-"""Guard against replies that claim a smart-home action without a tool call.
+"""Language-neutral guard for smart-home actions.
 
-Reasoning models sometimes answer a command with "I'll turn on the lights now."
-and end the turn without calling any Home Assistant tool, so nothing happens.
-These helpers detect that case so the tool loop can ask the model once more
-and, if it still does not call a tool, tell the user honestly.
+Reasoning models sometimes answer a device command with "I'll turn on the
+lights now." and end the turn without a successful tool call, so nothing
+happens. Nothing here parses the model's or the user's text:
+
+- Success/failure is decided only from structured tool results of the turn
+  (which non-read-only tools ran, and whether they returned an error).
+- Whether the final reply claims an action comes from the model itself via a
+  structured final answer (``FINAL_RESPONSE_FORMAT``: ``speech`` plus
+  ``action_claimed``), so it works in any language.
 """
 
 from __future__ import annotations
 
+import json
 from typing import Any
-import re
 
-# User text that looks like a device command (English / Finnish / Swedish).
-_COMMAND_RE = re.compile(
-    r"\b("
-    # English
-    r"turn|switch|dim|brighten|open|close|lock|unlock|start|stop|activate|"
-    r"deactivate|enable|disable|pause|resume|set"
-    r")\b"
-    r"|\b("
-    # Finnish imperatives / common phrasing
-    r"laita|laittakaa|sytytä|sammuta|kytke|käynnistä|pysäytä|avaa|sulje|"
-    r"lukitse|avaa lukko|himmennä|kirkasta|säädä|aseta|nosta|laske|vaihda"
-    r")\w*\b"
-    r"|\bpäälle\b|\bpois päältä\b"
-    r"|\b(tänd|släck|slå på|stäng av|öppna|stäng|lås)\b",
-    re.IGNORECASE,
-)
+# Structured final answer for conversation turns. Tool-call turns are not
+# affected; only a text reply is constrained to this schema.
+FINAL_RESPONSE_FORMAT: dict[str, Any] = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "assist_reply",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "speech": {
+                    "type": "string",
+                    "description": (
+                        "The reply spoken/shown to the user, in the user's "
+                        "language, plain text."
+                    ),
+                },
+                "action_claimed": {
+                    "type": "boolean",
+                    "description": (
+                        "true if the speech says that you performed, are "
+                        "performing or will perform an action that changes "
+                        "something in the home (turn on/off, set, open, "
+                        "start, ...); false for answers, questions, status "
+                        "reports and refusals."
+                    ),
+                },
+            },
+            "required": ["speech", "action_claimed"],
+            "additionalProperties": False,
+        },
+    },
+}
 
-# Assistant text that claims (or announces) having performed an action.
-_CLAIM_RE = re.compile(
-    r"\b(i'?ll|i will|i'?m going to|i am going to|let me|i'?ve|i have|now)\b"
-    r"[^.?!]{0,60}?\b("
-    r"turn(ed|ing)?|switch(ed|ing)?|set(ting)?|dimm?(ed|ing)?|brighten(ed|ing)?|"
-    r"open(ed|ing)?|clos(e|ed|ing)|lock(ed|ing)?|unlock(ed|ing)?|"
-    r"start(ed|ing)?|stop(ped|ping)?|activat(e|ed|ing)|run(ning)?|"
-    r"paus(e|ed|ing)|resum(e|ed|ing)"
-    r")\b"
-    r"|\b(turn(ed|ing)|switch(ed|ing))\s+(the\s+)?\w*\s*(on|off)\b"
-    r"|\b(done|ok(ay)?)[,!.]"
-    # Finnish: first-person / passive forms of common actions
-    r"|\b(sytytän|sytytin|sytytetty|sammutan|sammutin|sammutettu|laitan|laitoin|"
-    r"laitettu|kytken|kytkin|kytketty|käynnistän|käynnistin|käynnistetty|"
-    r"pysäytän|pysäytin|avaan|avasin|avattu|suljen|suljin|suljettu|lukitsen|"
-    r"lukitsin|lukittu|himmennän|himmensin|säädän|säädin|asetan|asetin|"
-    r"asetettu|selvä|tehty|valmis)\b",
-    re.IGNORECASE,
-)
+
+def parse_final_response(text: str | None) -> tuple[str, bool | None]:
+    """Return (speech, action_claimed) from a structured final answer.
+
+    If the content is not the expected JSON object (model ignored the
+    format), return the raw text and None (unknown).
+    """
+    raw = (text or "").strip()
+    if not raw.startswith("{"):
+        return raw, None
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return raw, None
+    if not isinstance(data, dict) or not isinstance(data.get("speech"), str):
+        return raw, None
+    claimed = data.get("action_claimed")
+    return data["speech"].strip(), claimed if isinstance(claimed, bool) else None
+
 
 CORRECTION_PROMPT = (
-    "You replied without calling any tool, so nothing was actually done in "
-    "the home. If the user asked to control or check a device, area or "
-    "entity, call the appropriate Home Assistant tool now. Use the exact "
-    "entity or area name, or one of its aliases, from the smart home "
-    "context; map inflected or misheard names (e.g. Finnish genitive forms) "
-    "to the closest exposed name. If a tool reports no match, try again with "
-    "the closest corrected name. If you cannot perform the action, say so "
-    "honestly. Never claim an action you did not perform. Reply briefly in "
-    "the user's language."
+    "No Home Assistant action succeeded in this turn, so nothing was changed "
+    "in the home. If the user asked to control a device, area or entity, "
+    "call the appropriate Home Assistant tool now, using an exact entity or "
+    "area name, or one of its aliases, from the smart home context; map "
+    "misheard or inflected names to the closest listed name. If a tool "
+    "reports no match, try again with the closest corrected name. If you "
+    "cannot perform the action, say so honestly. Never claim an action you "
+    "did not perform."
 )
-
-_NOT_DONE: dict[str, str] = {
-    "en": "Sorry, I couldn't do that — no device command was sent.",
-    "fi": "Valitettavasti en saanut sitä tehtyä, eikä laitteille lähetetty komentoa.",
-    "sv": "Tyvärr kunde jag inte göra det – inget kommando skickades.",
-    "de": "Das konnte ich leider nicht ausführen – es wurde kein Befehl gesendet.",
-}
-
-_NO_CONTROL: dict[str, str] = {
-    "en": (
-        "I can't control devices: Home Assistant control is not enabled for "
-        "this assistant. Select Assist under 'Control Home Assistant' in the "
-        "xAI Grok integration options."
-    ),
-    "fi": (
-        "En pysty ohjaamaan laitteita, koska Home Assistantin ohjaus ei ole "
-        "käytössä tälle avustajalle. Valitse Assist kohtaan 'Control Home "
-        "Assistant' xAI Grok -integraation asetuksissa."
-    ),
-}
-
-_LANGUAGE_NAMES: dict[str, str] = {
-    "en": "English",
-    "fi": "Finnish",
-    "sv": "Swedish",
-    "de": "German",
-    "fr": "French",
-    "es": "Spanish",
-    "it": "Italian",
-    "nl": "Dutch",
-    "pl": "Polish",
-    "pt": "Portuguese",
-    "da": "Danish",
-    "nb": "Norwegian",
-    "hu": "Hungarian",
-}
-
-
-def _primary(language: str | None) -> str:
-    return (language or "en").replace("_", "-").split("-")[0].lower()
-
-
-def looks_like_command(text: str | None) -> bool:
-    """Return True if the user text looks like a device command."""
-    return bool(text and _COMMAND_RE.search(text))
-
-
-def claims_action(text: str | None) -> bool:
-    """Return True if assistant text announces or claims an action."""
-    return bool(text and _CLAIM_RE.search(text))
-
-
-def not_done_message(language: str | None) -> str:
-    """Honest reply when the model claimed an action but called no tool."""
-    return _NOT_DONE.get(_primary(language), _NOT_DONE["en"])
-
-
-def no_control_message(language: str | None) -> str:
-    """Reply when a device command arrives but no LLM API/tools are enabled."""
-    return _NO_CONTROL.get(_primary(language), _NO_CONTROL["en"])
-
-
-def is_not_done_message(text: str | None) -> bool:
-    return bool(text) and (
-        text in _NOT_DONE.values() or text in _NO_CONTROL.values()
-    )
 
 
 def language_instruction(language: str | None) -> str:
-    """System-prompt line that pins the reply language."""
+    """System-prompt line that pins the reply language by its code."""
     code = (language or "").strip()
     if not code or code == "*":
-        return "Always reply in the language of the user's message."
-    name = _LANGUAGE_NAMES.get(_primary(code))
-    label = f"{name} ({code})" if name else code
+        return "Respond in the language of the user's message."
     return (
-        "Always reply in the language of the user's message. The user's "
-        f"Assist language is {label}; reply in it unless the user writes in "
-        "another language."
+        f"Respond in the user's language (language code: {code}) unless the "
+        "user writes in another language."
     )
 
 

@@ -19,10 +19,8 @@ from homeassistant.helpers import device_registry as dr, llm
 
 from .action_guard import (
     CORRECTION_PROMPT,
-    claims_action,
-    looks_like_command,
-    no_control_message,
-    not_done_message,
+    FINAL_RESPONSE_FORMAT,
+    parse_final_response,
     summarize_turn_tools,
 )
 from homeassistant.helpers.entity import Entity
@@ -536,6 +534,8 @@ class GrokBaseLLMEntity(Entity):
     ) -> None:
         """Initialize the base entity."""
         self.entry = entry
+        # Per-conversation action-guard outcome of the last turn
+        self._turn_outcomes: dict[str, dict[str, Any]] = {}
         self.subentry = subentry
         if subentry is not None:
             # Use the device name only (has_entity_name). Setting both the
@@ -849,16 +849,18 @@ class GrokBaseLLMEntity(Entity):
             else RECOMMENDED_MAX_TOKENS
         )
 
-        # Action guard state for this turn (see action_guard.py)
+        # Action guard state for this turn (see action_guard.py). Conversation
+        # turns ask for a structured final answer (speech + action_claimed) so
+        # claims are detected without parsing text in any language.
         corrected = False
-        user_text = next(
-            (
-                c.content
-                for c in reversed(chat_log.content)
-                if isinstance(c, conversation.UserContent)
-            ),
-            None,
+        structured_final = (
+            service == "conversation"
+            and response_format is None
+            and working_messages is not None
         )
+        outcome: dict[str, Any] = {}
+        if structured_final:
+            self._turn_outcomes[chat_log.conversation_id] = outcome
 
         for _iteration in range(max_iterations):
             if working_messages is None:
@@ -932,26 +934,41 @@ class GrokBaseLLMEntity(Entity):
                 )
                 LOGGER.debug("xAI system prompt: %s", system_prompt)
 
+            final_format_used = structured_final and use_response_format is None
+            request_kwargs: dict[str, Any] = {
+                "model": model,
+                "messages": request_messages,
+                "max_tokens": options.get(CONF_MAX_TOKENS, default_max_tokens),
+                "top_p": options.get(CONF_TOP_P, RECOMMENDED_TOP_P),
+                "temperature": options.get(
+                    CONF_TEMPERATURE, RECOMMENDED_TEMPERATURE
+                ),
+                "tools": use_tools,
+                "tool_choice": "auto" if use_tools else None,
+                "reasoning_effort": options.get(
+                    CONF_REASONING_EFFORT, RECOMMENDED_REASONING_EFFORT
+                ),
+                "user": chat_log.conversation_id,
+                "response_format": (
+                    FINAL_RESPONSE_FORMAT if final_format_used else use_response_format
+                ),
+            }
             try:
-                result = await async_chat_completion(
-                    client,
-                    model=model,
-                    messages=request_messages,
-                    max_tokens=options.get(CONF_MAX_TOKENS, default_max_tokens),
-                    top_p=options.get(CONF_TOP_P, RECOMMENDED_TOP_P),
-                    temperature=options.get(
-                        CONF_TEMPERATURE, RECOMMENDED_TEMPERATURE
-                    ),
-                    tools=use_tools,
-                    tool_choice="auto" if use_tools else None,
-                    reasoning_effort=options.get(
-                        CONF_REASONING_EFFORT, RECOMMENDED_REASONING_EFFORT
-                    ),
-                    user=chat_log.conversation_id,
-                    response_format=use_response_format,
+                result = await async_chat_completion(client, **request_kwargs)
+            except openai.BadRequestError as err:
+                if not final_format_used:
+                    raise
+                # Model/API rejected the structured final answer: continue
+                # this turn with plain text (no claim detection).
+                LOGGER.warning(
+                    "xAI rejected structured final answer for %s (%s); "
+                    "continuing without it",
+                    model,
+                    err,
                 )
-            except openai.OpenAIError:
-                raise
+                structured_final = final_format_used = False
+                request_kwargs["response_format"] = None
+                result = await async_chat_completion(client, **request_kwargs)
 
             choice = result.choices[0]
             message = choice.message
@@ -1032,89 +1049,77 @@ class GrokBaseLLMEntity(Entity):
                 continue
 
             raw_text = strip_reasoning_markup(message.content)
+            action_claimed: bool | None = None
+            if final_format_used:
+                raw_text, action_claimed = parse_final_response(raw_text)
             full_response = (
                 raw_text if skip_json_strip else _strip_json_from_response(raw_text)
             )
 
-            # Action guard: the model answered a command (or claimed an
-            # action) but no action tool succeeded in this turn - it called
-            # no tool, only read-only tools (e.g. GetLiveContext), or the
-            # action tool failed (e.g. no area matched a misheard name).
-            # Ask once more with an explicit correction; if it still claims
-            # an action, reply honestly instead of pretending.
-            turn_tools = summarize_turn_tools(chat_log)
-            guard_applies = (
-                service == "conversation"
-                and bool(use_tools)
-                and not turn_tools["action_ok"]
-                and response_format is None
-                and working_messages is not None
-                and choice.finish_reason != "length"
-            )
-            # No HA tools at all (no LLM API selected, or chat-only mode): the
-            # model cannot act, so never let it claim that it did.
-            if (
-                service == "conversation"
-                and not use_tools
-                and response_format is None
-                and claims_action(full_response)
-                and looks_like_command(user_text)
-            ):
-                LOGGER.warning(
-                    "Device command but no Home Assistant tools are available "
-                    "(select Assist under 'Control Home Assistant' in the "
-                    "integration options); not passing on the model's claim: %r",
-                    full_response,
+            # Action guard, decided only from structured data: tool results of
+            # this turn and the model's own action_claimed flag.
+            if structured_final and choice.finish_reason != "length":
+                turn = summarize_turn_tools(chat_log)
+                outcome["action_failed"] = (
+                    turn["action_failed"] and not turn["action_ok"]
                 )
-                language = (
-                    chat_log.llm_api.llm_context.language
-                    if chat_log.llm_api
-                    else getattr(self, "_turn_language", None)
-                )
-                full_response = no_control_message(language)
-            if guard_applies and not corrected and (
-                claims_action(full_response) or looks_like_command(user_text)
-            ):
-                corrected = True
-                LOGGER.info(
-                    "xAI reply had no successful action tool call for a likely "
-                    "action (tool errors: %s); requesting a corrected answer: %r",
-                    turn_tools["errors"],
-                    full_response,
-                )
-                chat_log.async_trace(
-                    {
-                        "action_guard": {
-                            "retry": True,
-                            "reply": full_response,
-                            "tool_errors": turn_tools["errors"],
-                        }
-                    }
-                )
-                correction = CORRECTION_PROMPT
-                if turn_tools["errors"]:
-                    correction += (
-                        " Tool errors so far in this turn: "
-                        + "; ".join(turn_tools["errors"])[:500]
-                    )
-                working_messages.append(
-                    {"role": "assistant", "content": full_response or ""}
-                )
-                working_messages.append({"role": "system", "content": correction})
-                await self._record_usage(model, p_tok, c_tok, service=service)
-                continue
-            if guard_applies and corrected and claims_action(full_response):
-                LOGGER.warning(
-                    "xAI claimed an action without a successful action tool "
-                    "call (after retry); replying honestly instead: %r",
-                    full_response,
-                )
-                language = (
-                    chat_log.llm_api.llm_context.language
-                    if chat_log.llm_api
-                    else None
-                )
-                full_response = not_done_message(language)
+                if not use_tools:
+                    if action_claimed:
+                        # No LLM API / chat-only: the model cannot act.
+                        LOGGER.warning(
+                            "Model claimed an action but no Home Assistant "
+                            "tools are available (select Assist under "
+                            "'Control Home Assistant'); reply suppressed: %r",
+                            full_response,
+                        )
+                        outcome["fallback"] = "no_control"
+                        full_response = ""
+                elif not turn["action_ok"] and (
+                    turn["action_failed"] or action_claimed
+                ):
+                    if not corrected:
+                        corrected = True
+                        LOGGER.info(
+                            "No successful action tool call (claimed=%s, "
+                            "tool errors=%s); requesting a corrected answer: %r",
+                            action_claimed,
+                            turn["errors"],
+                            full_response,
+                        )
+                        chat_log.async_trace(
+                            {
+                                "action_guard": {
+                                    "retry": True,
+                                    "reply": full_response,
+                                    "action_claimed": action_claimed,
+                                    "tool_errors": turn["errors"],
+                                }
+                            }
+                        )
+                        correction = CORRECTION_PROMPT
+                        if turn["errors"]:
+                            correction += (
+                                " Tool errors so far in this turn: "
+                                + "; ".join(turn["errors"])[:500]
+                            )
+                        working_messages.append(
+                            {"role": "assistant", "content": full_response or ""}
+                        )
+                        working_messages.append(
+                            {"role": "system", "content": correction}
+                        )
+                        await self._record_usage(
+                            model, p_tok, c_tok, service=service
+                        )
+                        continue
+                    if action_claimed:
+                        LOGGER.warning(
+                            "Model still claims an action without a successful "
+                            "action tool call after retry; reply suppressed: %r",
+                            full_response,
+                        )
+                        outcome["fallback"] = "action_not_performed"
+                        full_response = ""
 
             if full_response or skip_json_strip:
                 async for _ in chat_log.async_add_assistant_content(
